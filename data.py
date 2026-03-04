@@ -18,6 +18,7 @@ _DATA_DIR = Path(__file__).parent / 'data'
 _DATA_DIR.mkdir(exist_ok=True)
 
 arcades_json: Path = _DATA_DIR / 'arcades.json'
+_config_json: Path = _DATA_DIR / 'config.json'
 
 # 字体路径：将 ShangguMonoSC-Regular.otf 放在本插件目录下即可
 _FONT_PATH = Path(__file__).parent / 'ShangguMonoSC-Regular.otf'
@@ -48,6 +49,35 @@ async def writefile(file: Path, data: Any) -> bool:
     async with aiofiles.open(file, 'w', encoding='utf-8') as f:
         await f.write(json.dumps(data, ensure_ascii=False, indent=4))
     return True
+
+
+# =================== 配置管理 ===================
+
+def load_config() -> dict:
+    """读取配置文件"""
+    if _config_json.exists():
+        return json.load(open(_config_json, 'r', encoding='utf-8'))
+    return {}
+
+
+async def save_config(config: dict) -> None:
+    """保存配置文件"""
+    await writefile(_config_json, config)
+
+
+def get_group_region(group_id: int) -> Optional[str]:
+    """获取群地区"""
+    config = load_config()
+    return config.get('group_regions', {}).get(str(group_id))
+
+
+async def set_group_region(group_id: int, region: str) -> None:
+    """设置群地区"""
+    config = load_config()
+    if 'group_regions' not in config:
+        config['group_regions'] = {}
+    config['group_regions'][str(group_id)] = region
+    await save_config(config)
 
 
 # =================== 图片工具 ===================
@@ -198,6 +228,79 @@ class ArcadeData:
 
 
 arcade = ArcadeData()
+
+
+# =================== AI 模糊匹配 ===================
+
+def search_by_region(region: str) -> List[Arcade]:
+    """筛选 location 以 region 开头的机厅"""
+    return [arc for arc in arcade.total if arc.location.startswith(region)]
+
+
+async def fuzzy_match_arcade(name: str, group_id: int) -> Optional[Arcade]:
+    """
+    通过 DeepSeek AI 模糊匹配机厅名称。
+    1. 获取群的地区配置
+    2. 筛选该地区的机厅
+    3. 调用 DeepSeek API 选出最匹配的
+    """
+    region = get_group_region(group_id)
+    if not region:
+        return None
+
+    config = load_config()
+    api_key = config.get('deepseek_api_key')
+    if not api_key:
+        return None
+
+    candidates = search_by_region(region)
+    if not candidates:
+        return None
+
+    # 构建候选列表文本
+    candidate_text = '\n'.join(
+        f'{i+1}. {arc.name}' for i, arc in enumerate(candidates)
+    )
+
+    prompt = (
+        f'你是一个机厅名称匹配助手。用户输入了一个简称或缩写，'
+        f'请从以下机厅列表中找出最可能匹配的一个。\n'
+        f'如果没有合理的匹配，只回复"无"。\n'
+        f'如果有匹配，只回复对应的序号数字，不要回复其他任何内容。\n\n'
+        f'机厅列表：\n{candidate_text}\n\n'
+        f'用户输入：{name}'
+    )
+
+    try:
+        connector = aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver())
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.post(
+                'https://api.deepseek.com/chat/completions',
+                headers={
+                    'Authorization': f'Bearer {api_key}',
+                    'Content-Type': 'application/json',
+                },
+                json={
+                    'model': 'deepseek-chat',
+                    'messages': [{'role': 'user', 'content': prompt}],
+                    'temperature': 0,
+                    'max_tokens': 16,
+                },
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                answer = data['choices'][0]['message']['content'].strip()
+                if answer == '无' or not answer.isdigit():
+                    return None
+                idx = int(answer) - 1
+                if 0 <= idx < len(candidates):
+                    return candidates[idx]
+                return None
+    except Exception:
+        logger.error(f'DeepSeek API 调用失败: {traceback.format_exc()}')
+        return None
 
 
 # =================== 业务逻辑 ===================
@@ -359,6 +462,41 @@ async def subscribe(group_id: int, arcadeName: str, sub: bool) -> str:
     if change:
         await arcade.total.save_arcade()
     return msg
+
+
+async def batch_subscribe_region(group_id: int, region: str, sub: bool) -> str:
+    """按地区批量订阅/取消订阅机厅，同时设置/清除群地区配置"""
+    candidates = search_by_region(region)
+    if not candidates:
+        return f'未找到地区「{region}」的任何机厅'
+
+    added = []
+    skipped = []
+    removed = []
+    for arc in candidates:
+        if sub:
+            if group_id not in arc.group:
+                arc.group.append(group_id)
+                added.append(arc.name)
+            else:
+                skipped.append(arc.name)
+        else:
+            if group_id in arc.group:
+                arc.group.remove(group_id)
+                removed.append(arc.name)
+
+    await arcade.total.save_arcade()
+
+    if sub:
+        await set_group_region(group_id, region)
+        lines = [f'已批量订阅「{region}」共 {len(added)} 家机厅']
+        if skipped:
+            lines.append(f'其中 {len(skipped)} 家已订阅，跳过')
+        lines.append(f'同时已设置群地区为：{region}')
+    else:
+        lines = [f'已批量取消订阅「{region}」共 {len(removed)} 家机厅']
+
+    return '\n'.join(lines)
 
 
 async def log_removed_arcades(removed: List[Arcade]) -> None:

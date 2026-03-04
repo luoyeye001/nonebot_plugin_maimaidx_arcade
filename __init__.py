@@ -11,9 +11,13 @@ from nonebot.plugin import PluginMetadata
 
 from .data import (
     arcade,
+    batch_subscribe_region,
     download_arcade_info,
+    fuzzy_match_arcade,
+    get_group_region,
     image_to_base64,
     log_removed_arcades,
+    set_group_region,
     subscribe,
     text_to_image,
     update_alias,
@@ -35,12 +39,15 @@ _HELP_TEXT = """排卡指令如下：
 修改机厅 <店名> 数量 <数量> ... 修改机厅信息
 添加机厅别名 <店名> <别名>
 订阅机厅 <店名> 订阅机厅，简化后续指令
+订阅地区 <地区> 按地区批量订阅（如：浙江省宁波市）
+取消订阅地区 <地区> 按地区批量取消订阅
 查看订阅 查看群组订阅机厅的信息
 取消订阅机厅 <店名> 取消群组机厅订阅
 查找机厅,查询机厅,机厅查找,机厅查询 <关键词> 查询对应机厅信息
 <店名/别名>人数设置,设定,=,增加,加,+,减少,减,-<人数> 操作排卡人数
 <店名/别名>有多少人,有几人,有几卡,几人,几卡 查看排卡人数
-机厅几人 查看已订阅机厅排卡人数"""
+机厅几人 查看已订阅机厅排卡人数
+设置地区 <地区> 设置群所在地区（如：浙江省杭州市）"""
 
 
 # =================== 启动加载 ===================
@@ -237,6 +244,35 @@ async def subscribe_arcade(
     await subscribe_matcher.finish(msg, at_sender=True)
 
 
+# =================== 按地区批量订阅/取消订阅 ===================
+
+region_sub_matcher = on_startswith(('订阅地区', '取消订阅地区'), priority=5, block=True)
+
+
+@region_sub_matcher.handle()
+async def region_subscribe(bot: Bot, event: GroupMessageEvent):
+    text = event.get_plaintext().strip()
+    if text.startswith('取消订阅地区'):
+        sub = False
+        region = text[len('取消订阅地区'):].strip()
+    else:
+        sub = True
+        region = text[len('订阅地区'):].strip()
+
+    is_admin = await (GROUP_ADMIN | GROUP_OWNER | SUPERUSER)(bot, event)
+    if not is_admin:
+        await region_sub_matcher.finish('仅允许管理员订阅和取消订阅', at_sender=True)
+
+    if not region:
+        await region_sub_matcher.finish(
+            '格式：订阅地区 xx省xx市（如：浙江省宁波市）', at_sender=True
+        )
+
+    gid = event.group_id
+    msg = await batch_subscribe_region(gid, region, sub)
+    await region_sub_matcher.finish(msg, at_sender=True)
+
+
 # =================== 查看订阅 ===================
 
 check_sub_matcher = on_fullmatch(('查看订阅', '查看订阅机厅'), priority=5, block=True)
@@ -261,6 +297,30 @@ async def check_subscribe(bot: Bot, event: GroupMessageEvent):
         msg = '该群未订阅任何机厅'
 
     await check_sub_matcher.finish(msg, at_sender=True)
+
+
+# =================== 设置地区 ===================
+
+region_matcher = on_startswith('设置地区', priority=5, block=True)
+
+
+@region_matcher.handle()
+async def set_region(bot: Bot, event: GroupMessageEvent):
+    is_admin = await (GROUP_ADMIN | GROUP_OWNER | SUPERUSER)(bot, event)
+    if not is_admin:
+        await region_matcher.finish('仅允许管理员设置地区', at_sender=True)
+
+    text = event.get_plaintext().strip()
+    region = text[len('设置地区'):].strip()
+    if not region:
+        current = get_group_region(event.group_id)
+        if current:
+            await region_matcher.finish(f'当前群地区：{current}', at_sender=True)
+        else:
+            await region_matcher.finish('格式：设置地区 xx省xx市（直辖市为 xx市）', at_sender=True)
+
+    await set_group_region(event.group_id, region)
+    await region_matcher.finish(f'已设置群地区为：{region}', at_sender=True)
 
 
 # =================== 查找机厅 ===================
@@ -455,9 +515,20 @@ async def arcade_query_person(
     if name:
         arcade_list = arcade.total.search_name(name)
         if not arcade_list:
-            await query_person_matcher.finish('没有这样的机厅哦', at_sender=True)
-        result = arcade.total.arcade_to_msg(arcade_list)
-        await query_person_matcher.send('\n'.join(result))
+            # 尝试 AI 模糊匹配
+            matched = await fuzzy_match_arcade(name, gid)
+            if matched:
+                arcade_list = [matched]
+                result = arcade.total.arcade_to_msg(arcade_list)
+                msg = '\n'.join(result)
+                if matched.alias:
+                    msg += f'\n提示：该机厅已有别名 {", ".join(matched.alias)}，可直接使用别名查询'
+                await query_person_matcher.send(msg)
+            else:
+                await query_person_matcher.finish('没有这样的机厅哦', at_sender=True)
+        else:
+            result = arcade.total.arcade_to_msg(arcade_list)
+            await query_person_matcher.send('\n'.join(result))
     else:
         arcade_list = arcade.total.group_subscribe_arcade(gid)
         if arcade_list:
