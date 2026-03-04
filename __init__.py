@@ -14,6 +14,7 @@ from .data import (
     batch_subscribe_region,
     download_arcade_info,
     fuzzy_match_arcade,
+    fuzzy_match_subscribed,
     get_group_region,
     image_to_base64,
     log_removed_arcades,
@@ -413,11 +414,22 @@ async def arcade_person(
                 _arcade.append(_a)
                 break
 
+        match_result = None
         if not _arcade:
-            await person_matcher.finish('已订阅的机厅中未找到该机厅', at_sender=True)
-        else:
-            msg = await update_person(_arcade, nickname, value, person)
-            await person_matcher.send(msg, at_sender=True)
+            match_result = await fuzzy_match_subscribed(arcadeName, gid)
+            if match_result:
+                _arcade = [match_result.arcade]
+            else:
+                await person_matcher.finish('已订阅的机厅中未找到该机厅', at_sender=True)
+
+        msg = await update_person(_arcade, nickname, value, person)
+        if match_result:
+            msg += f'\n[AI匹配 | 匹配度: {match_result.confidence}%]'
+            if match_result.confidence < 80 and match_result.alternatives:
+                msg += '\n你可能在找：'
+                for alt_arc, alt_conf in match_result.alternatives:
+                    msg += f'\n  - {alt_arc.name}（匹配度: {alt_conf}%）'
+        await person_matcher.send(msg, at_sender=True)
 
 
 # =================== 排卡人数操作（省略运算符，如「md1」等同于「md=1」）===================
@@ -460,8 +472,12 @@ async def arcade_person_direct(bot: Bot, event: GroupMessageEvent):
                 _arcade.append(_a)
                 break
 
+        match_result = None
         if not _arcade:
-            return
+            match_result = await fuzzy_match_subscribed(arcadeName, gid)
+            if not match_result:
+                return
+            _arcade = [match_result.arcade]
 
         if op in ('+', '＋'):
             value = '+'
@@ -470,6 +486,12 @@ async def arcade_person_direct(bot: Bot, event: GroupMessageEvent):
         else:
             value = '='
         msg = await update_person(_arcade, nickname, value, person)
+        if match_result:
+            msg += f'\n[AI匹配 | 匹配度: {match_result.confidence}%]'
+            if match_result.confidence < 80 and match_result.alternatives:
+                msg += '\n你可能在找：'
+                for alt_arc, alt_conf in match_result.alternatives:
+                    msg += f'\n  - {alt_arc.name}（匹配度: {alt_conf}%）'
         await person_direct_matcher.send(msg, at_sender=True)
     except Exception:
         pass
@@ -516,13 +538,17 @@ async def arcade_query_person(
         arcade_list = arcade.total.search_name(name)
         if not arcade_list:
             # 尝试 AI 模糊匹配
-            matched = await fuzzy_match_arcade(name, gid)
-            if matched:
-                arcade_list = [matched]
-                result = arcade.total.arcade_to_msg(arcade_list)
+            match_result = await fuzzy_match_arcade(name, gid)
+            if match_result:
+                result = arcade.total.arcade_to_msg([match_result.arcade])
                 msg = '\n'.join(result)
-                if matched.alias:
-                    msg += f'\n提示：该机厅已有别名 {", ".join(matched.alias)}，可直接使用别名查询'
+                msg += f'\n[AI匹配 | 匹配度: {match_result.confidence}%]'
+                if match_result.confidence < 80 and match_result.alternatives:
+                    msg += '\n你可能在找：'
+                    for alt_arc, alt_conf in match_result.alternatives:
+                        msg += f'\n  - {alt_arc.name}（匹配度: {alt_conf}%）'
+                if match_result.arcade.alias:
+                    msg += f'\n提示：该机厅已有别名 {", ".join(match_result.arcade.alias)}，可直接使用别名查询'
                 await query_person_matcher.send(msg)
             else:
                 await query_person_matcher.finish('没有这样的机厅哦', at_sender=True)

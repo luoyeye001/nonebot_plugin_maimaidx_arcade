@@ -232,41 +232,46 @@ arcade = ArcadeData()
 
 # =================== AI 模糊匹配 ===================
 
+class FuzzyMatchResult:
+    """模糊匹配结果"""
+    def __init__(self, arcade, confidence, alternatives):
+        self.arcade = arcade              # Arcade - 最佳匹配
+        self.confidence = confidence      # int - 匹配度 0-100
+        self.alternatives = alternatives  # [(Arcade, int), ...] - 次选
+
+
 def search_by_region(region: str) -> List[Arcade]:
     """筛选 location 以 region 开头的机厅"""
     return [arc for arc in arcade.total if arc.location.startswith(region)]
 
 
-async def fuzzy_match_arcade(name: str, group_id: int) -> Optional[Arcade]:
-    """
-    通过 DeepSeek AI 模糊匹配机厅名称。
-    1. 获取群的地区配置
-    2. 筛选该地区的机厅
-    3. 调用 DeepSeek API 选出最匹配的
-    """
-    region = get_group_region(group_id)
-    if not region:
-        return None
-
+async def _call_deepseek_match(name: str, candidates: List[Arcade]) -> Optional[FuzzyMatchResult]:
+    """调用 DeepSeek API 进行模糊匹配，返回匹配结果含匹配度"""
     config = load_config()
     api_key = config.get('deepseek_api_key')
-    if not api_key:
+    if not api_key or not candidates:
         return None
 
-    candidates = search_by_region(region)
-    if not candidates:
-        return None
-
-    # 构建候选列表文本
-    candidate_text = '\n'.join(
-        f'{i+1}. {arc.name}' for i, arc in enumerate(candidates)
-    )
+    candidate_lines = []
+    for i, arc in enumerate(candidates):
+        line = f'{i+1}. {arc.name}'
+        if arc.alias:
+            line += f'（别名: {", ".join(arc.alias)}）'
+        candidate_lines.append(line)
+    candidate_text = '\n'.join(candidate_lines)
 
     prompt = (
-        f'你是一个机厅名称匹配助手。用户输入了一个简称或缩写，'
-        f'请从以下机厅列表中找出最可能匹配的一个。\n'
-        f'如果没有合理的匹配，只回复"无"。\n'
-        f'如果有匹配，只回复对应的序号数字，不要回复其他任何内容。\n\n'
+        f'你是一个机厅名称匹配助手。用户输入了一个简称、缩写或拼音首字母，'
+        f'请从以下机厅列表中找出最可能匹配的机厅。\n'
+        f'注意：用户常用拼音首字母缩写，如"kljq"代表"快乐街区"，"fyl"代表"菲游乐"。\n\n'
+        f'请严格按以下格式回复（不要回复任何其他内容）：\n'
+        f'序号,匹配度;序号,匹配度;序号,匹配度\n\n'
+        f'规则：\n'
+        f'- 匹配度为0-100的整数\n'
+        f'- 按匹配度从高到低排列，最多3个\n'
+        f'- 只列出匹配度大于30的结果\n'
+        f'- 如果没有任何合理匹配，只回复"无"\n\n'
+        f'示例：3,95;7,60;1,40\n\n'
         f'机厅列表：\n{candidate_text}\n\n'
         f'用户输入：{name}'
     )
@@ -284,7 +289,7 @@ async def fuzzy_match_arcade(name: str, group_id: int) -> Optional[Arcade]:
                     'model': 'deepseek-chat',
                     'messages': [{'role': 'user', 'content': prompt}],
                     'temperature': 0,
-                    'max_tokens': 16,
+                    'max_tokens': 32,
                 },
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
@@ -292,15 +297,44 @@ async def fuzzy_match_arcade(name: str, group_id: int) -> Optional[Arcade]:
                     return None
                 data = await resp.json()
                 answer = data['choices'][0]['message']['content'].strip()
-                if answer == '无' or not answer.isdigit():
+
+                if answer == '无':
                     return None
-                idx = int(answer) - 1
-                if 0 <= idx < len(candidates):
-                    return candidates[idx]
-                return None
+
+                # 解析 "3,95;7,60;1,40"
+                matches = []
+                for part in answer.split(';'):
+                    nums = part.strip().split(',')
+                    if len(nums) == 2 and nums[0].strip().isdigit() and nums[1].strip().isdigit():
+                        idx = int(nums[0].strip()) - 1
+                        conf = int(nums[1].strip())
+                        if 0 <= idx < len(candidates):
+                            matches.append((candidates[idx], conf))
+
+                if not matches:
+                    return None
+
+                best_arcade, best_conf = matches[0]
+                alternatives = matches[1:3]
+                return FuzzyMatchResult(best_arcade, best_conf, alternatives)
     except Exception:
         logger.error(f'DeepSeek API 调用失败: {traceback.format_exc()}')
         return None
+
+
+async def fuzzy_match_arcade(name: str, group_id: int) -> Optional[FuzzyMatchResult]:
+    """通过 DeepSeek AI 模糊匹配机厅名称（按地区筛选）"""
+    region = get_group_region(group_id)
+    if not region:
+        return None
+    candidates = search_by_region(region)
+    return await _call_deepseek_match(name, candidates)
+
+
+async def fuzzy_match_subscribed(name: str, group_id: int) -> Optional[FuzzyMatchResult]:
+    """通过 DeepSeek AI 模糊匹配已订阅机厅"""
+    candidates = arcade.total.group_subscribe_arcade(group_id)
+    return await _call_deepseek_match(name, candidates)
 
 
 # =================== 业务逻辑 ===================
